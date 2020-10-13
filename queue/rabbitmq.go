@@ -2,6 +2,7 @@ package queue
 
 import (
 	"github.com/streadway/amqp"
+	"time"
 )
 
 type Connection struct {
@@ -19,14 +20,17 @@ type Queue struct {
 	url        string
 	name       string
 	delay      bool
+	bound      bool
+	logger     Logger
 }
 
 func NewRabbitQueue(name, url string) (*Queue, error) {
 	var err error
 
 	q := &Queue{
-		url:  url,
-		name: name,
+		url:    url,
+		name:   name,
+		logger: &defaultLogger{},
 	}
 
 	connection, err := amqp.Dial(q.url)
@@ -38,34 +42,47 @@ func NewRabbitQueue(name, url string) (*Queue, error) {
 		connction: connection,
 	})
 
+	q.queueBindToExchange()
+
+	return q, nil
+}
+
+func (q *Queue) queueBindToExchange() error {
+	if q.bound {
+		return nil
+	}
+
 	conn, err := q.getConnection()
 	if err != nil {
-		return nil, err
+		return err
 	}
 	ch, err := conn.getChannel()
 
 	if err != nil {
-		return nil, err
+		return err
 	}
 
 	defer ch.Close()
 
 	_, err = ch.QueueDeclare(q.name, true, false, false, false, nil)
 	if err != nil {
-		return nil, err
+		return err
 	}
 
-	exchange := q.name + "_exchange"
+	exchange := q.getExchangeName()
 	err = ch.ExchangeDeclare(exchange, "fanout", true, false, false, false, nil)
 	if err != nil {
-		return nil, err
-	}
-	err = ch.QueueBind(q.name, "", exchange, false, nil)
-	if err != nil {
-		return nil, err
+		return err
 	}
 
-	return q, nil
+	err = ch.QueueBind(q.name, "", exchange, false, nil)
+	if err != nil {
+		return err
+	}
+
+	q.bound = true
+
+	return nil
 }
 
 func (q *Queue) startDelay() error {
@@ -93,7 +110,7 @@ func (q *Queue) startDelay() error {
 		false, // exclusive
 		false, // no-wait
 		amqp.Table{
-			"x-dead-letter-exchange": q.name + "_exchange",
+			"x-dead-letter-exchange": q.getExchangeName(),
 		}, // arguments
 	)
 	if err != nil {
@@ -112,6 +129,13 @@ func (q *Queue) startDelay() error {
 
 	q.delay = true
 	return nil
+}
+
+func (q *Queue) getExchangeName() string {
+	return q.name + "_exchange"
+}
+func (q *Queue) getDelayExchangeName() string {
+	return q.name + "_delay_exchange"
 }
 
 func (q *Queue) getConnection() (*Connection, error) {
@@ -133,13 +157,13 @@ func (q *Queue) Send(body []byte) error {
 }
 
 func (q *Queue) Delay(body []byte, expire string) error {
-	name := q.name
+	exchangeName := q.getExchangeName()
 	if expire != "" {
 		err := q.startDelay()
 		if err != nil {
 			return err
 		}
-		name = name + "_delay"
+		exchangeName = q.getDelayExchangeName()
 	}
 
 	conn, err := q.getConnection()
@@ -154,10 +178,10 @@ func (q *Queue) Delay(body []byte, expire string) error {
 
 	defer ch.Close()
 	err = ch.Publish(
-		name+"_exchange", // exchange
-		"",               // routing key
-		false,            // mandatory
-		false,            // immediate
+		exchangeName, // exchange
+		"",           // routing key
+		false,        // mandatory
+		false,        // immediate
 		amqp.Publishing{
 			ContentType:  "text/plain",
 			Body:         body,
@@ -169,28 +193,63 @@ func (q *Queue) Delay(body []byte, expire string) error {
 }
 
 func (q *Queue) Receive(callback func(body []byte)) error {
+	go q.receive(callback)
+	return nil
+}
+
+func (q *Queue) receive(callback func(body []byte)) {
+	defer func() {
+		if err := recover(); err != nil {
+			q.logger.Error("rabbit receive error: %+v", err)
+			time.Sleep(3 * time.Second)
+			q.receive(callback)
+		}
+	}()
+
 	conn, err := q.getConnection()
 	if err != nil {
-		return err
+		panic(err)
 	}
 	ch, err := conn.getChannel()
 
 	if err != nil {
-		return err
+		panic(err)
 	}
 
-	//defer ch.Close()
+	q.logger.Info("rabbit start receive")
+
+	defer ch.Close()
+	closeChan := make(chan *amqp.Error, 1)
+	notifyClose := ch.NotifyClose(closeChan)
+	closeFlag := false
 
 	msgs, err := ch.Consume(q.name, "", true, false, false, false, nil)
 	if err != nil {
-		return err
+		panic(err)
 	}
 
-	go func() {
-		for d := range msgs {
+	for {
+		select {
+		case e := <-notifyClose:
+			q.logger.Error("rabbit channel error: %s", e.Error())
+			time.Sleep(5 * time.Second)
+			//StartAMQPConsume()
+			closeFlag = true
+		case d := <-msgs:
 			callback(d.Body)
 		}
-	}()
+		if closeFlag {
+			break
+		}
+	}
 
-	return nil
+	panic("rabbit receive interrupt")
+}
+
+func (q *Queue) SetLogger(l Logger) () {
+	q.logger = l
+}
+
+func (q *Queue) EnableLog(e bool) {
+	q.logger.Enable(e)
 }

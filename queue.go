@@ -15,6 +15,8 @@ type Queue interface {
 	Send(body []byte) error
 	Delay(body []byte, expire string) error
 	Receive(callback func(body []byte)) error
+	SetLogger(l queue.Logger)
+	EnableLog(e bool)
 }
 
 func New(c Config) (Queue, error) {
